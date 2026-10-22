@@ -40,7 +40,7 @@ public:
 
 private:
     static constexpr std::size_t queue_capacity = 4096;
-    static constexpr std::size_t subscription_count = 5;
+    static constexpr std::size_t subscription_count = 6;
 
     static void CALLBACK callback(
         HWINEVENTHOOK hook,

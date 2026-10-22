@@ -171,7 +171,7 @@ void test_classifier() {
     std::puts("PASS: native window classification");
 }
 
-int run_event_fixture(const DWORD parent_thread_id) {
+int run_event_fixture(const DWORD parent_thread_id, const bool burst) {
     WindowClass window_class;
     Window window{L"TWM cross-process fixture"};
     if (!PostThreadMessageW(parent_thread_id, fixture_window_message,
@@ -180,9 +180,20 @@ int run_event_fixture(const DWORD parent_thread_id) {
         win32_failure("PostThreadMessageW fixture announcement");
     }
 
+    if (burst) {
+        // Переполняем очередь наблюдателя событиями только собственного HWND.
+        // Родитель доставляет callbacks, но намеренно не дренирует очередь.
+        for (unsigned index = 0; index < 8192; ++index) {
+            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, window.get(), OBJID_WINDOW, 0);
+        }
+        return 0;
+    }
+
     // Delays keep each lifecycle stage observable; the whole fixture lasts < 1 second.
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     window.show();
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, window.get(), OBJID_CLIENT, 0);
+    NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, window.get(), OBJID_WINDOW, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds{150});
     window.hide();
     std::this_thread::sleep_for(std::chrono::milliseconds{150});
@@ -194,7 +205,8 @@ int run_event_fixture(const DWORD parent_thread_id) {
 
 class FixtureProcess final {
 public:
-    explicit FixtureProcess(const DWORD parent_thread_id) {
+    explicit FixtureProcess(const DWORD parent_thread_id,
+                            const wchar_t* mode = L"--event-fixture") {
         std::wstring executable(32768, L'\0');
         const DWORD length = GetModuleFileNameW(nullptr, executable.data(),
                                                 static_cast<DWORD>(executable.size()));
@@ -203,7 +215,7 @@ public:
         }
         require(length < executable.size(), "Executable path was truncated");
         executable.resize(length);
-        std::wstring command_line = L"\"" + executable + L"\" --event-fixture " +
+        std::wstring command_line = L"\"" + executable + L"\" " + mode + L" " +
                                     std::to_wstring(parent_thread_id);
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
@@ -273,6 +285,11 @@ void test_win_events() {
             require(event.thread_id != GetCurrentThreadId(),
                     "WINEVENT_SKIPOWNPROCESS leaked a test-process event");
             if (event.thread_id == fixture.thread_id()) {
+                if (event.event >= EVENT_OBJECT_CREATE &&
+                    event.event <= EVENT_OBJECT_END) {
+                    require(event.object_id == OBJID_WINDOW && event.child_id == 0,
+                            "Non-window accessibility events leaked through the filter");
+                }
                 events.push_back(event);
             }
         }
@@ -327,23 +344,79 @@ void test_win_events() {
     std::puts("PASS: cross-process WinEvent lifecycle and own-process exclusion");
 }
 
+void test_event_overflow() {
+    twm::WinEventSource source;
+    source.start();
+    FixtureProcess fixture{GetCurrentThreadId(), L"--burst-fixture"};
+    const auto deadline = Clock::now() + std::chrono::seconds{7};
+    auto drain_deadline = deadline;
+    bool exited = false;
+
+    while (Clock::now() < deadline && (!exited || Clock::now() < drain_deadline)) {
+        MSG message{};
+        while (Clock::now() < deadline &&
+               PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        // pop() здесь намеренно не вызывается: имитируем отставание потребителя.
+        if (!exited) {
+            const DWORD wait = WaitForSingleObject(fixture.handle(), 0);
+            if (wait == WAIT_FAILED) {
+                win32_failure("WaitForSingleObject burst fixture");
+            }
+            if (wait == WAIT_OBJECT_0) {
+                DWORD exit_code = 0;
+                if (!GetExitCodeProcess(fixture.handle(), &exit_code)) {
+                    win32_failure("GetExitCodeProcess burst fixture");
+                }
+                require(exit_code == 0, "Burst fixture exited unsuccessfully");
+                exited = true;
+                drain_deadline = Clock::now() + std::chrono::milliseconds{200};
+            }
+        }
+        if (MsgWaitForMultipleObjectsEx(0, nullptr, 10, QS_ALLINPUT,
+                                       MWMO_INPUTAVAILABLE) == WAIT_FAILED) {
+            win32_failure("MsgWaitForMultipleObjectsEx burst fixture");
+        }
+    }
+    require(exited, "Burst fixture timed out");
+    require(source.take_rescan_request(), "Queue overflow must request reconciliation");
+    require(!source.take_rescan_request(), "Reconciliation request must be consumable");
+    unsigned received = 0;
+    twm::WindowEvent event{};
+    while (source.pop(event)) {
+        ++received;
+    }
+    require(received == 4096, "Overflow must retain exactly the bounded queue capacity");
+    source.stop();
+    source.start();
+    require(!source.pop(event) && !source.take_rescan_request(),
+            "Restart must not retain old events or overflow state");
+    source.stop();
+    std::puts("PASS: bounded WinEvent queue overflow, rescan signal and restart");
+}
+
 } // namespace
 
 int main(const int argc, char* argv[]) {
     try {
-        if (argc == 3 && std::strcmp(argv[1], "--event-fixture") == 0) {
+        if (argc == 3 && (std::strcmp(argv[1], "--event-fixture") == 0 ||
+                          std::strcmp(argv[1], "--burst-fixture") == 0)) {
             DWORD parent_thread = 0;
             const char* const end = argv[2] + std::strlen(argv[2]);
             const auto parsed = std::from_chars(argv[2], end, parent_thread);
             require(parsed.ec == std::errc{} && parsed.ptr == end && parent_thread != 0,
                     "Invalid parent thread ID");
-            return run_event_fixture(parent_thread);
+            return run_event_fixture(parent_thread,
+                                     std::strcmp(argv[1], "--burst-fixture") == 0);
         }
 
         require(argc == 1, "Unexpected test arguments");
         WindowClass window_class;
         test_classifier();
         test_win_events();
+        test_event_overflow();
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

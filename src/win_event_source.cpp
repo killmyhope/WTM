@@ -45,6 +45,7 @@ void WinEventSource::start() {
         {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED},
         {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND},
         {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
+        {EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND},
     }};
 
     active_source_ = this;
@@ -149,6 +150,8 @@ void CALLBACK WinEventSource::callback(
     case EVENT_SYSTEM_FOREGROUND:
     case EVENT_SYSTEM_MINIMIZESTART:
     case EVENT_SYSTEM_MINIMIZEEND:
+    case EVENT_SYSTEM_MOVESIZESTART:
+    case EVENT_SYSTEM_MOVESIZEEND:
         break;
     default:
         return;

@@ -1,19 +1,43 @@
 # Диагностический реестр окон Windows
 
+Следующий этап и критерии его готовности: [Master-Stack на одном мониторе](docs/NEXT_STAGE.md).
+
+На 22 октября реализованы шаги 1–4: модель кандидатов, solver Master-Stack,
+monitor_context, hidden PMv2 control_window, чтение window_geometry, worker
+window_actuator и layout_controller с подтверждением фактической геометрии.
+Следующий шаг — hotkeys, явный возврат floating в тайлинг и восстановление позиций.
+
 Первый этап TWM: C++20, CMake, Win32 и DWM. Приложение наблюдает окна текущего
-desktop, классифицирует их и выводит изменения в консоль. Оно не перемещает
-окна, не меняет оформление, фокус или горячие клавиши.
+desktop, классифицирует их и выводит изменения в консоль. По умолчанию меняет
+позицию только своего скрытого control window для DPI-привязки. Реальный тайлинг
+приложений требует отдельного флага `--manage-windows`; фокус и Z-order сохраняются.
 
 ## Структура
 
 ```text
 CMakeLists.txt
 include/twm/
+  geometry.hpp             # Чистые insets, преобразования и DIP→px
+  window_geometry.hpp      # Read-only HWND snapshot, double-read, exact S_OK
+  monitor_context.hpp      # Выбранный монитор, rcWork, DPI, revision
+  control_window.hpp       # Hidden PMv2 HWND и системные уведомления
+  window_actuator.hpp      # jthread, bounded queues, leases, Win32 submission
+  layout_controller.hpp    # Canonical targets, acknowledgement, retry, refinement
+  layout.hpp               # Rect, min/max/step, solver API, бюджет уточнений
+  managed_windows.hpp      # Стабильный порядок, availability, floating/Master
   win_event_source.hpp     # WinEvent + ограниченная очередь событий
   window_classifier.hpp   # Снимок окна, идентичность, результат фильтра
   window_registry.hpp     # Поколения HWND и переходы состояния
   console_logger.hpp      # Unicode-консоль / UTF-8 stdout
 src/
+  geometry.cpp
+  window_geometry.cpp
+  monitor_context.cpp
+  control_window.cpp
+  window_actuator.cpp
+  layout_controller.cpp
+  master_stack.cpp         # Чистый solver: slot + target, без Windows API
+  managed_windows.cpp
   main.cpp                # Message loop, начальный снимок, сверка, Ctrl+C
   win_event_source.cpp
   window_classifier.cpp
@@ -23,6 +47,13 @@ resources/
   app.manifest            # asInvoker, PerMonitorV2
   app.rc
 tests/
+  layout_controller_tests.cpp # Детерминированный fake transport, без Win32 resize
+  window_actuator_tests.cpp   # Двигает только HWND собственного дочернего процесса
+  geometry_tests.cpp        # Числа без HWND, 2000 roundtrip-проверок
+  window_geometry_tests.cpp # Fixture HWND и ошибки/гонки через injected API
+  monitor_context_tests.cpp # Реальные мониторы и сообщения control window
+  layout_tests.cpp         # Числа, ограничения, steps и 1500 oracle-сценариев
+  managed_windows_tests.cpp
   registry_tests.cpp      # Детерминированные переходы и HWND reuse
   native_tests.cpp        # Настоящие HWND, DWM, межпроцессные WinEvents
 ```
@@ -54,6 +85,42 @@ ctest --test-dir build-msvc -C Debug --output-on-failure
 ```powershell
 .\build\window_diagnostics.exe --duration-ms 5000
 ```
+
+Для вычисления раскладки и targetOuter без перемещения приложений:
+
+```powershell
+.\build\window_diagnostics.exe --preview-layout --duration-ms 5000
+```
+
+План использует текущие проверенные insets и gaps 8 DIP, переведённые в физические
+px по DPI выбранного монитора. Максимизированные/скрытые окна не участвуют;
+нестабильная геометрия откладывает расчёт. Удачный план печатает WindowId,
+visible=(left,top,right,bottom), outer=(left,top,right,bottom). Периодическая сверка
+повторяет расчёт, одинаковый текст не дублируется. Контекст монитора и изменения
+его revision также выводятся в консоль.
+
+Для реального Master-Stack на мониторе выбранного при старте foreground-окна
+(primary fallback, если foreground недоступен):
+
+```powershell
+.\build\window_diagnostics.exe --manage-windows
+```
+
+`--manage-windows` и `--preview-layout` взаимоисключающие. При Ctrl+C/истечении
+`--duration-ms` новые команды отменяются, но уже отправленный async resize может
+примениться позднее. На этом шаге позиции при выходе **сохраняются**: восстановление
+WINDOWPLACEMENT и переключение управления горячей клавишей идут следующим шагом.
+Ручной move/resize приостанавливает управление окном, а после завершения оставляет
+его floating до явного возврата (пока — перезапуска процесса). Hidden/minimized,
+maximized и распознанные fullscreen окна не перемещаются.
+
+Контроллер сравнивает outer и visible с канонической целью (±1 px на грань),
+отдельно проверяет rcWork и пересечения. После отправки даётся 500 мс и максимум
+один ретрай для версии. Устойчивое увеличение размера уточняет минимум и запускает
+общий reflow; бюджет — max(1, число окон стека). Устойчивый меньший размер внутри
+slot принимается как constrained/unknown step, не повышает minimum и не меняет
+каноническую цель. LayoutInfeasible/исчерпание бюджета/неподтверждённая команда
+останавливают выдачу для текущей конфигурации с явным логом.
 
 MinGW-сборке нужны runtime DLL её toolchain в PATH. Нативные тесты требуют
 интерактивный Windows desktop с DWM. Они кратко показывают собственные окна
@@ -95,7 +162,7 @@ LOCATIONCHANGE, сверка и изменение заголовка не ду�
    нормальное сообщение, WM_QUIT и ошибку -1. Исключения не выходят из callbacks.
 
 Подписки: CREATE/DESTROY/SHOW/HIDE, STATECHANGE/LOCATIONCHANGE/NAMECHANGE,
-CLOAKED/UNCLOAKED, FOREGROUND и MINIMIZESTART/END. Для object events допускаются
+CLOAKED/UNCLOAKED, FOREGROUND, MINIMIZESTART/END и MOVESIZESTART/END. Для object events допускаются
 только OBJID_WINDOW/CHILDID_SELF; для system events это ограничение не применяется.
 
 WinEvents служат поводом проверить актуальное состояние. DESTROY дополнительно
@@ -151,14 +218,56 @@ DWMWA_CLOAKED и непустая геометрия. PID/TID повторно �
 
 ## Проверки
 
+`layout_controller_tests`: LOCATIONCHANGE до worker reply, начало deadline от
+submission, один retry, Backpressure, stale session, неизменность canonical target,
+±1 px, containment/overlap, 400/250/250 → 400/280/220, ограничение бюджета,
+grid 300 → 294, API failure и инвалидация DPI-контекста. Транспорт полностью fake.
+
+`window_actuator_tests`: запускает собственный дочерний fixture-процесс и получает
+его HWND через shared-memory handshake. Каждый вызов SetWindowPos проходит проверку
+PID и allowlist этих HWND. Проверяются реальное перемещение, coalescing, закрытие
+в очереди, min-size через WM_GETMINMAXINFO, дискретный шаг, задержка UI 1000 мс,
+отмена session/lease, минимизация, Backpressure и сохранение ответов при stop.
+Связка native controller + actuator должна сойтись без повторных команд после
+Settled. Тестам нужна рабочая область не менее 640×690 физических px. Пользовательские
+HWND не перечисляются и не передаются исполнителю; CLI `--manage-windows` тесты
+не запускают.
+
+`geometry_conversions`: visible↔outer, неотрицательные insets, выход за rcWork,
+нулевые размеры/overflow, отрицательные origin, fit control HWND, DIP округление
+при 100/125/150/175/200%, 2000 roundtrip-проверок.
+
+`window_geometry_tests`: настоящие fixture HWND и double-read снимки; минимизация,
+скрытие, cloak, закрытие и изменение стилей между чтениями; S_FALSE/E_FAIL DWM,
+ошибки на каждой границе чтения, некорректные placement/insets, PMv2 контракт.
+
+`monitor_context_tests`: все доступные реальные мониторы, hidden HWND внутри rcWork,
+GetDpiForWindow, WM_DPICHANGED/suggested rect, DISPLAYCHANGE и SPI_SETWORKAREA,
+ошибка handler без stale Ready, отсутствие implicit fallback после невалидного
+HMONITOR и отказ DPI-unaware потока. Уведомления отправляются только собственному
+control window; реальные настройки дисплеев не изменяются. Если в среде один
+монитор, тест не подтверждает физический mixed-DPI сценарий на втором дисплее.
+
+`master_stack_solver`: 0/1/много окон, gaps и остатки деления, отрицательные
+координаты, min/max, каскад ограничений с конечным бюджетом, step/base (300 → 294),
+LayoutInfeasible без частичного результата, некорректные входы, крайние int32.
+1500 сценариев сравнивают feasibility с независимым перебором допустимых длин,
+проверяют containment, ограничения и отсутствие пересечений. Тест не включает HWND.
+
+`managed_window_order`: admission и закрытые ID, стабильность порядка при
+hide/restore/Pending, floating и promotion в Master, ручной move, снимки и constraints.
+Модель и solver собраны в библиотеку twm_layout, не зависящую от Windows API.
+
 `registry_transitions`: дедупликация, rename, hide/restore, ошибки свойств,
 исключение по стилям, удаление скрытого окна, смена PID, same-thread HWND reuse,
-устаревший и повторный DESTROY.
+устаревший и повторный DESTROY, переименование скрытого окна перед закрытием;
+интеграция lifecycle с ManagedWindows, Pending и повторное использование HWND.
 
 `native_windows_and_events`: настоящие обычные/пустые/hidden/tool/noactivate/
 owned/child/cloaked/destroyed окна; межпроцессная последовательность
 CREATE → SHOW → HIDE → SHOW → DESTROY; WINEVENT_SKIPOWNPROCESS и отсутствие
-дублирующихся подписок.
+дублирующихся подписок; фильтр неоконных accessibility events; переполнение
+очереди, запрос сверки и очистка состояния после restart.
 
 ## Контракты Windows API
 
